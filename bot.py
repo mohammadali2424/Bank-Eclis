@@ -27,16 +27,16 @@ from db import (
 )
 from receipt import generate_receipt_image
 
-# ---------------- Config (توکن و شناسه‌ها دست‌نخورده) ----------------
-BOT_TOKEN = "8021975466:AAGV_CanoaR3FQ-7c3WcPXbZRPpK6_K-KMQ"  # همان توکن خودت
-BANK_GROUP_ID = int(os.environ.get("BANK_GROUP_ID", "-1002585326279"))
-BANK_OWNER_ID = int(os.environ.get("BANK_OWNER_ID", "8423995337"))
+# ---------------- Config ----------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8021975466:AAGV_CanoaR3FQ-7c3WcPXbZRPpK6_K-KMQ")
+BANK_GROUP_ID = int(os.getenv("BANK_GROUP_ID", "-1002585326279"))
+BANK_OWNER_ID = int(os.getenv("BANK_OWNER_ID", "8423995337"))
 
 # پورت و URL عمومی سرویس برای ست‌کردن وبهوک
-PORT = int(os.environ.get("PORT", "8000"))  # Render خودش ست می‌کند
-PUBLIC_URL = os.environ.get("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
-WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")  # اختیاری ولی توصیه می‌شود
-WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"  # مسیر اختصاصی وبهوک (بدون تغییر توکن)
+PORT = int(os.getenv("PORT", "8000"))
+PUBLIC_URL = os.getenv("BASE_URL") or os.environ.get("RENDER_EXTERNAL_URL")
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "eclis_bank_secret")
+WEBHOOK_PATH = f"/webhook/{BOT_TOKEN}"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("bankbot")
@@ -369,13 +369,13 @@ async def list_admins_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = "\n".join([f"- {name} ({tg_id})" for tg_id, name in admins])
     await update.message.reply_text("👑 ادمین‌ها:\n" + text)
 
-# ---------------- Webhook Server (Starlette/Uvicorn) ----------------
+# ---------------- Webhook Server ----------------
 async def main():
     # ویندوز لوکال: حلقهٔ ایونت سازگار
     if sys.platform == "win32":
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # 1) PTB Application بدون Updater (چون خودمان وب‌سرور داریم)
+    # 1) PTB Application بدون Updater
     application = Application.builder().token(BOT_TOKEN).updater(None).build()
 
     # 2) هندلرها
@@ -401,34 +401,52 @@ async def main():
     application.add_handler(CommandHandler("removeadmin", remove_admin_cmd))
     application.add_handler(CommandHandler("listadmins", list_admins_cmd))
 
-    # 3) DB init
-    await init_db(BANK_OWNER_ID)
+    # 3) DB init با هندلینگ خطا
+    try:
+        await init_db(BANK_OWNER_ID)
+        logger.info("✅ Database initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Database initialization failed: {e}")
+        # ادامه اجرا حتی اگر دیتابیس خطا داد
 
     # 4) ساخت URL وبهوک
-    base_url = PUBLIC_URL or f"http://localhost:{PORT}"
+    base_url = PUBLIC_URL
+    if not base_url:
+        logger.error("❌ PUBLIC_URL is not set")
+        return
+    
     webhook_url = f"{base_url}{WEBHOOK_PATH}"
     logger.info(f"Setting webhook to: {webhook_url}")
 
     # 5) ثبت وبهوک در تلگرام
-    await application.bot.set_webhook(
-        url=webhook_url,
-        allowed_updates=Update.ALL_TYPES,
-        secret_token=(WEBHOOK_SECRET or None),
-        drop_pending_updates=True
-    )
+    try:
+        await application.bot.set_webhook(
+            url=webhook_url,
+            allowed_updates=Update.ALL_TYPES,
+            secret_token=(WEBHOOK_SECRET or None),
+            drop_pending_updates=True
+        )
+        logger.info("✅ Webhook set successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to set webhook: {e}")
+        return
 
     # 6) مسیر وبهوک + healthcheck
     async def telegram_webhook(request: Request) -> Response:
-        # تأیید توکن مخفی هدر (اختیاری ولی امن)
+        # تأیید توکن مخفی هدر
         if WEBHOOK_SECRET:
             hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
             if hdr != WEBHOOK_SECRET:
                 return PlainTextResponse("forbidden", status_code=403)
 
         # دریافت آپدیت و هل‌دادن به صف PTB
-        data = await request.json()
-        await application.update_queue.put(Update.de_json(data=data, bot=application.bot))
-        return Response()
+        try:
+            data = await request.json()
+            await application.update_queue.put(Update.de_json(data=data, bot=application.bot))
+            return Response()
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            return PlainTextResponse("error", status_code=500)
 
     async def health(_: Request) -> PlainTextResponse:
         return PlainTextResponse("ok")
@@ -436,19 +454,30 @@ async def main():
     routes = [
         Route(WEBHOOK_PATH, telegram_webhook, methods=["POST"]),
         Route("/healthz", health, methods=["GET"]),
+        Route("/", health, methods=["GET"]),
     ]
     starlette_app = Starlette(routes=routes)
 
-    # 7) اجرای همزمان PTB + Uvicorn (الگوی رسمی PTB)
+    # 7) اجرای همزمان PTB + Uvicorn
     webserver = uvicorn.Server(
-        uvicorn.Config(app=starlette_app, host="0.0.0.0", port=PORT, use_colors=False)
+        uvicorn.Config(
+            app=starlette_app, 
+            host="0.0.0.0", 
+            port=PORT, 
+            use_colors=False,
+            log_level="info"
+        )
     )
 
     async with application:
         await application.start()
         logger.info("🤖 Bot (webhook mode) is running...")
-        await webserver.serve()
-        await application.stop()
+        try:
+            await webserver.serve()
+        except Exception as e:
+            logger.error(f"Server error: {e}")
+        finally:
+            await application.stop()
 
 if __name__ == "__main__":
     asyncio.run(main())
