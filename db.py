@@ -4,6 +4,8 @@ import random
 import string
 from decimal import Decimal, InvalidOperation
 import asyncpg
+import asyncio
+import ssl
 
 DATABASE_URL = os.getenv("DATABASE_URL")  # e.g. from Supabase (pooler or direct)
 POOL: asyncpg.Pool | None = None
@@ -23,7 +25,33 @@ async def _ensure_pool():
     if POOL is None:
         if not DATABASE_URL:
             raise RuntimeError("DATABASE_URL is not set. Provide your Supabase Postgres connection string.")
-        POOL = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+        
+        # تنظیمات SSL برای اتصال امن
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+        
+        try:
+            POOL = await asyncpg.create_pool(
+                DATABASE_URL,
+                min_size=1,
+                max_size=5,
+                ssl=ssl_context,
+                command_timeout=60
+            )
+        except Exception as e:
+            print(f"Error creating pool: {e}")
+            # تلاش مجدد بدون SSL
+            try:
+                POOL = await asyncpg.create_pool(
+                    DATABASE_URL,
+                    min_size=1,
+                    max_size=5,
+                    command_timeout=60
+                )
+            except Exception as e2:
+                print(f"Error creating pool without SSL: {e2}")
+                raise
 
 # ---------- init ----------
 async def init_db(owner_id: int):
