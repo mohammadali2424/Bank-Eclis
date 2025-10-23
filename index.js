@@ -2,7 +2,7 @@
 const express = require('express');
 const { Telegraf } = require('telegraf');
 const { Pool } = require('pg');
-const { createCanvas, loadImage, registerFont } = require('canvas');
+const { createCanvas, loadImage } = require('canvas');
 const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
@@ -11,21 +11,46 @@ const crypto = require('crypto');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// متغیرهای محیطی
-const BOT_TOKEN = process.env.BOT_TOKEN || '8021975466:AAGV_CanoaR3FQ-7c3WcPXbZRPpK6_K-KMQ';
+// متغیرهای محیطی - همه از environment variables می‌آیند
+const BOT_TOKEN = process.env.BOT_TOKEN;
 const DATABASE_URL = process.env.DATABASE_URL;
 const BANK_OWNER_ID = parseInt(process.env.BANK_OWNER_ID || '8423995337');
-const BANK_GROUP_ID = process.env.BANK_GROUP_ID || '-1002585326279';
+const BANK_GROUP_ID = process.env.BANK_GROUP_ID;
 const WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || 'eclis_bank_secret_2024';
+
+// بررسی وجود توکن
+if (!BOT_TOKEN) {
+  console.error('❌ BOT_TOKEN is required!');
+  process.exit(1);
+}
 
 // ایجاد ربات
 const bot = new Telegraf(BOT_TOKEN);
 
-// اتصال به دیتابیس
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
-});
+// اتصال به دیتابیس با تنظیمات بهتر
+let pool;
+if (DATABASE_URL) {
+  pool = new Pool({
+    connectionString: DATABASE_URL,
+    ssl: {
+      rejectUnauthorized: false
+    },
+    connectionTimeoutMillis: 10000,
+    idleTimeoutMillis: 30000,
+    max: 5
+  });
+
+  // تست اتصال
+  pool.on('connect', () => {
+    console.log('✅ Connected to PostgreSQL');
+  });
+
+  pool.on('error', (err) => {
+    console.error('❌ PostgreSQL pool error:', err);
+  });
+} else {
+  console.log('⚠️ DATABASE_URL not set, running in limited mode');
+}
 
 // Middleware
 app.use(express.json());
@@ -51,6 +76,11 @@ function parseAmount(amountStr) {
 
 // -------------------- توابع دیتابیس --------------------
 async function initDb() {
+  if (!pool) {
+    console.log('⚠️ Skipping DB init - no database connection');
+    return;
+  }
+
   try {
     const client = await pool.connect();
     
@@ -110,16 +140,19 @@ async function initDb() {
         "INSERT INTO accounts (account_id, owner_tg_id, type, name, balance) VALUES ('ACC-001', $1, 'BANK', 'Central Bank', 0)",
         [BANK_OWNER_ID]
       );
+      console.log('✅ Central bank account created');
     }
 
     client.release();
     console.log('✅ Database initialized successfully');
   } catch (error) {
-    console.error('❌ Database initialization failed:', error);
+    console.error('❌ Database initialization failed:', error.message);
   }
 }
 
 async function createUser(tgId, username, fullName, code) {
+  if (!pool) return [null, 'Database not available'];
+
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -131,7 +164,7 @@ async function createUser(tgId, username, fullName, code) {
     );
 
     if (codeCheck.rows.length === 0) {
-      return [null, 'Invalid registration code.'];
+      return [null, 'کد ثبت‌نام نامعتبر است.'];
     }
 
     // بررسی وجود کاربر
@@ -141,7 +174,7 @@ async function createUser(tgId, username, fullName, code) {
     );
 
     if (userCheck.rows.length > 0) {
-      return [null, 'User already registered.'];
+      return [null, 'شما قبلاً ثبت‌نام کرده‌اید.'];
     }
 
     // حذف کد استفاده شده
@@ -187,6 +220,8 @@ async function createUser(tgId, username, fullName, code) {
 }
 
 async function getUserByTgId(tgId) {
+  if (!pool) return null;
+  
   try {
     const result = await pool.query(
       'SELECT * FROM users WHERE tg_id = $1',
@@ -194,12 +229,14 @@ async function getUserByTgId(tgId) {
     );
     return result.rows[0] || null;
   } catch (error) {
-    console.error('Error getting user:', error);
+    console.error('Error getting user:', error.message);
     return null;
   }
 }
 
 async function listUserAccounts(tgId) {
+  if (!pool) return [];
+  
   try {
     const result = await pool.query(
       'SELECT account_id, type, name, balance FROM accounts WHERE owner_tg_id = $1',
@@ -212,12 +249,14 @@ async function listUserAccounts(tgId) {
       balance: parseFloat(row.balance)
     }));
   } catch (error) {
-    console.error('Error listing accounts:', error);
+    console.error('Error listing accounts:', error.message);
     return [];
   }
 }
 
 async function getUserByAccount(accountId) {
+  if (!pool) return null;
+  
   try {
     const result = await pool.query(
       'SELECT owner_tg_id FROM accounts WHERE account_id = $1',
@@ -244,22 +283,24 @@ async function getUserByAccount(accountId) {
       account_id: user.personal_account
     };
   } catch (error) {
-    console.error('Error getting user by account:', error);
+    console.error('Error getting user by account:', error.message);
     return null;
   }
 }
 
 async function transferFunds(fromAcc, toAcc, amount) {
+  if (!pool) return [false, 'Database not available'];
+  
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
 
     if (amount <= 0) {
-      return [false, 'Amount must be > 0.'];
+      return [false, 'مبلغ باید بزرگتر از صفر باشد.'];
     }
 
     if (fromAcc === toAcc) {
-      return [false, 'Cannot transfer to the same account.'];
+      return [false, 'امکان انتقال به حساب خود وجود ندارد.'];
     }
 
     // بررسی موجودی
@@ -274,11 +315,11 @@ async function transferFunds(fromAcc, toAcc, amount) {
     );
 
     if (fromBalance.rows.length === 0 || toBalance.rows.length === 0) {
-      return [false, 'Account not found.'];
+      return [false, 'حساب مورد نظر یافت نشد.'];
     }
 
     if (parseFloat(fromBalance.rows[0].balance) < amount) {
-      return [false, 'Not enough balance.'];
+      return [false, 'موجودی کافی نیست.'];
     }
 
     // انجام انتقال
@@ -293,7 +334,7 @@ async function transferFunds(fromAcc, toAcc, amount) {
     );
 
     await client.query('COMMIT');
-    return [true, 'Completed'];
+    return [true, 'انجام شد'];
   } catch (error) {
     await client.query('ROLLBACK');
     return [false, error.message];
@@ -303,17 +344,21 @@ async function transferFunds(fromAcc, toAcc, amount) {
 }
 
 async function createTransaction(txid, fromAcc, toAcc, amount, status) {
+  if (!pool) return;
+  
   try {
     await pool.query(
       'INSERT INTO transactions (txid, from_acc, to_acc, amount, status) VALUES ($1, $2, $3, $4, $5)',
       [txid, fromAcc, toAcc, amount, status]
     );
   } catch (error) {
-    console.error('Error creating transaction:', error);
+    console.error('Error creating transaction:', error.message);
   }
 }
 
 async function addRegisterCode(code) {
+  if (!pool) return [false, 'Database not available'];
+  
   try {
     await pool.query(
       'INSERT INTO register_codes (code) VALUES ($1) ON CONFLICT (code) DO NOTHING',
@@ -326,6 +371,8 @@ async function addRegisterCode(code) {
 }
 
 async function isAdmin(tgId) {
+  if (!pool) return false;
+  
   try {
     const result = await pool.query(
       'SELECT 1 FROM admins WHERE tg_id = $1',
@@ -333,7 +380,7 @@ async function isAdmin(tgId) {
     );
     return result.rows.length > 0;
   } catch (error) {
-    console.error('Error checking admin:', error);
+    console.error('Error checking admin:', error.message);
     return false;
   }
 }
@@ -344,6 +391,76 @@ function isBankOwner(tgId) {
 
 async function isAdminOrOwner(tgId) {
   return (await isAdmin(tgId)) || isBankOwner(tgId);
+}
+
+// -------------------- توابع جدید برای دستورات --------------------
+async function deleteAccount(accountId) {
+  if (!pool) return [false, 'Database not available'];
+  
+  try {
+    if (accountId.toUpperCase() === 'ACC-001') {
+      return [false, 'امکان حذف حساب اصلی بانک وجود ندارد.'];
+    }
+
+    const result = await pool.query(
+      'DELETE FROM accounts WHERE account_id = $1',
+      [accountId.toUpperCase()]
+    );
+
+    if (result.rowCount === 0) {
+      return [false, 'حساب مورد نظر یافت نشد.'];
+    }
+
+    return [true, null];
+  } catch (error) {
+    return [false, error.message];
+  }
+}
+
+async function transferAccountOwnership(accountId, newOwnerTgId) {
+  if (!pool) return [false, 'Database not available'];
+  
+  try {
+    // بررسی وجود حساب
+    const accountCheck = await pool.query(
+      'SELECT 1 FROM accounts WHERE account_id = $1',
+      [accountId.toUpperCase()]
+    );
+
+    if (accountCheck.rows.length === 0) {
+      return [false, 'حساب مورد نظر یافت نشد.'];
+    }
+
+    // انتقال مالکیت
+    await pool.query(
+      'UPDATE accounts SET owner_tg_id = $1 WHERE account_id = $2',
+      [newOwnerTgId, accountId.toUpperCase()]
+    );
+
+    return [true, null];
+  } catch (error) {
+    return [false, error.message];
+  }
+}
+
+async function takeFromAccount(fromAccountId, amount) {
+  if (!pool) return [false, 'Database not available'];
+  
+  return await transferFunds(fromAccountId, 'ACC-001', amount);
+}
+
+async function getAllAccounts() {
+  if (!pool) return [];
+  
+  try {
+    const result = await pool.query(
+      'SELECT account_id, owner_tg_id, type, name, balance FROM accounts ORDER BY type, account_id'
+    );
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting all accounts:', error.message);
+    return [];
+  }
 }
 
 // -------------------- توابع receipt --------------------
@@ -465,6 +582,9 @@ const HELP_TEXT = `📖 **دستورات ربات بانک سولن**
 /listusers - لیست کاربران
 /bankbalance - موجودی بانک
 /banktransfer <حساب مقصد> <مبلغ> - انتقال از حساب بانک
+/takefrom <حساب مبدا> <مبلغ> - برداشت از حساب کاربر
+/closeaccount <شماره حساب> - بستن حساب
+/transferowner <شماره حساب> <آیدی کاربر جدید> - انتقال مالکیت حساب
 
 👑 **دستورات مالک:**
 /addadmin <آیدی> <نام> - افزودن ادمین
@@ -487,12 +607,13 @@ bot.command('register', async (ctx) => {
   const user = ctx.from;
   console.log(`Register command from user: ${user.id}`);
   
-  const code = ctx.message.text.split(' ')[1];
-  if (!code) {
-    await ctx.reply('❌ لطف��ً کد ثبت‌نام را وارد کنید:\n/register <کد>');
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) {
+    await ctx.reply('❌ لطفاً کد ثبت‌نام را وارد کنید:\n/register <کد>');
     return;
   }
 
+  const code = args[0];
   try {
     const [accountId, msg] = await createUser(user.id, user.username || '', user.first_name || '', code);
     
@@ -678,6 +799,125 @@ bot.command('transfer', async (ctx) => {
   }
 });
 
+// --------------- دستورات جدید ---------------
+
+// دستور closeaccount
+bot.command('closeaccount', async (ctx) => {
+  const userId = ctx.from.id;
+  console.log(`Closeaccount command from user: ${userId}`);
+  
+  if (!await isAdminOrOwner(userId)) {
+    await ctx.reply('❌ دسترسی denied. فقط ادمین‌ها می‌توانند از این دستور استفاده کنند.');
+    return;
+  }
+
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) {
+    await ctx.reply('❌ لطفاً شماره حساب را وارد کنید: /closeaccount <شماره حساب>');
+    return;
+  }
+
+  const accountId = args[0];
+  try {
+    const [success, msg] = await deleteAccount(accountId);
+    if (success) {
+      await ctx.reply(`✅ حساب ${accountId} با موفقیت بسته شد.`);
+    } else {
+      await ctx.reply(`❌ ${msg}`);
+    }
+  } catch (error) {
+    console.error('Error in closeaccount:', error);
+    await ctx.reply('❌ خطایی در بستن حساب رخ داد.');
+  }
+});
+
+// دستور transferowner
+bot.command('transferowner', async (ctx) => {
+  const userId = ctx.from.id;
+  console.log(`Transferowner command from user: ${userId}`);
+  
+  if (!await isAdminOrOwner(userId)) {
+    await ctx.reply('❌ دسترسی denied. فقط ادمین‌ها می‌توانند از این دستور استفاده کنند.');
+    return;
+  }
+
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length < 2) {
+    await ctx.reply('❌ فرمت دستور: /transferowner <شماره حساب> <آیدی کاربر جدید>');
+    return;
+  }
+
+  const accountId = args[0];
+  const newOwnerId = parseInt(args[1]);
+
+  if (isNaN(newOwnerId)) {
+    await ctx.reply('❌ آیدی کاربر جدید باید عدد باشد.');
+    return;
+  }
+
+  try {
+    const [success, msg] = await transferAccountOwnership(accountId, newOwnerId);
+    if (success) {
+      await ctx.reply(`✅ مالکیت حساب ${accountId} به کاربر ${newOwnerId} منتقل شد.`);
+    } else {
+      await ctx.reply(`❌ ${msg}`);
+    }
+  } catch (error) {
+    console.error('Error in transferowner:', error);
+    await ctx.reply('❌ خطایی در انتقال مالکیت رخ داد.');
+  }
+});
+
+// دستور takefrom
+bot.command('takefrom', async (ctx) => {
+  const userId = ctx.from.id;
+  console.log(`Takefrom command from user: ${userId}`);
+  
+  if (!await isAdminOrOwner(userId)) {
+    await ctx.reply('❌ دسترسی denied. فقط ادمین‌ها می‌توانند از این دستور استفاده کنند.');
+    return;
+  }
+
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length < 2) {
+    await ctx.reply('❌ فرمت دستور: /takefrom <شماره حساب مبدا> <مبلغ>');
+    return;
+  }
+
+  const fromAccount = args[0].toUpperCase();
+  const amount = parseAmount(args[1]);
+
+  if (!amount) {
+    await ctx.reply('❌ مبلغ نامعتبر است.');
+    return;
+  }
+
+  try {
+    const txid = generateTxId();
+    const [success, status] = await takeFromAccount(fromAccount, amount);
+    
+    await createTransaction(txid, fromAccount, 'ACC-001', amount, success ? 'Completed' : 'Failed');
+
+    const now = new Date().toISOString().replace('T', ' ').substring(0, 19);
+    const receiptPath = await generateReceiptImage(txid, now, fromAccount, 'ACC-001', amount, success ? 'Completed' : 'Failed');
+
+    await ctx.replyWithPhoto({ source: receiptPath }, {
+      caption: success ? 
+        `✅ **برداشت از حساب با موفقیت انجام شد!**\n\n` +
+        `• مبلغ: ${amount} سولن\n` +
+        `• از حساب: ${fromAccount}\n` +
+        `• به حساب بانک: ACC-001\n` +
+        `• کد تراکنش: ${txid}` :
+        `❌ برداشت ناموفق: ${status}`,
+      parse_mode: 'Markdown'
+    });
+
+  } catch (error) {
+    console.error('Error in takefrom:', error);
+    await ctx.reply('❌ خطایی در برداشت از حساب رخ داد.');
+  }
+});
+
 // دستور newcode (ادمین)
 bot.command('newcode', async (ctx) => {
   const userId = ctx.from.id;
@@ -687,12 +927,13 @@ bot.command('newcode', async (ctx) => {
     return;
   }
 
-  const code = ctx.message.text.split(' ')[1];
-  if (!code) {
+  const args = ctx.message.text.split(' ').slice(1);
+  if (args.length === 0) {
     await ctx.reply('❌ لطفاً کد را وارد کنید: /newcode <کد>');
     return;
   }
 
+  const code = args[0];
   try {
     const [ok, msg] = await addRegisterCode(code);
     if (ok) {
@@ -716,6 +957,11 @@ bot.command('bankbalance', async (ctx) => {
   }
 
   try {
+    if (!pool) {
+      await ctx.reply('❌ دیتابیس در دسترس نیست.');
+      return;
+    }
+
     const result = await pool.query(
       'SELECT balance FROM accounts WHERE account_id = $1',
       ['ACC-001']
@@ -726,6 +972,56 @@ bot.command('bankbalance', async (ctx) => {
   } catch (error) {
     console.error('Error in bankbalance:', error);
     await ctx.reply('❌ خطایی در دریافت موجودی بانک رخ داد.');
+  }
+});
+
+// دستور listusers (ادمین)
+bot.command('listusers', async (ctx) => {
+  const userId = ctx.from.id;
+  
+  if (!await isAdminOrOwner(userId)) {
+    await ctx.reply('❌ دسترسی denied. فقط ادمین‌ها می‌توانند از این دستور استفاده کنند.');
+    return;
+  }
+
+  try {
+    if (!pool) {
+      await ctx.reply('❌ دیتابیس در دسترس نیست.');
+      return;
+    }
+
+    const result = await pool.query(`
+      SELECT u.tg_id, u.username, u.full_name, a.account_id
+      FROM users u
+      JOIN accounts a ON a.owner_tg_id = u.tg_id AND a.type = 'PERSONAL'
+      ORDER BY u.full_name NULLS LAST
+    `);
+
+    if (result.rows.length === 0) {
+      await ctx.reply('📭 هیچ کاربری ثبت‌نام نکرده است.');
+      return;
+    }
+
+    let text = `👥 **لیست کاربران (${result.rows.length} نفر):**\n\n`;
+    result.rows.forEach(user => {
+      text += `• **${user.full_name}**\n`;
+      text += `  آیدی: @${user.username || 'ندارد'}\n`;
+      text += `  کد کاربری: ${user.tg_id}\n`;
+      text += `  شماره حساب: ${user.account_id}\n\n`;
+    });
+
+    // اگر متن خیلی طولانی شد، آن را تقسیم می‌کنیم
+    if (text.length > 4000) {
+      const chunks = text.match(/.{1,4000}/g) || [];
+      for (const chunk of chunks) {
+        await ctx.reply(chunk, { parse_mode: 'Markdown' });
+      }
+    } else {
+      await ctx.reply(text, { parse_mode: 'Markdown' });
+    }
+  } catch (error) {
+    console.error('Error in listusers:', error);
+    await ctx.reply('❌ خطایی در دریافت لیست کاربران رخ داد.');
   }
 });
 
